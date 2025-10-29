@@ -3,7 +3,7 @@
     "cond_image": "examples/single/pranav.jpg",
     "tts_audio": {
         "text": "Welcome to multi-talk, this is an audio-driven video generation model for multiple person.",
-        "human1_voice": "weights/Kokoro-82M/voices/af_heart.pt"
+        "human1_voice": "weights/Kokoro-82M/voices/am_michael.pt"
     },
     "cond_audio": {}
 }
