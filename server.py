@@ -142,6 +142,9 @@ def process_tts_single(text, save_dir, voice1):
     audios = []
     for i, (gs, ps, audio) in enumerate(generator):
         audios.append(audio)
+    if not audios:
+        print("❌ No audio generated")
+        return np.zeros(16000), os.path.join(save_dir, 's1.wav')
     audios = torch.concat(audios, dim=0)
     s1_sentences.append(audios)
     s1_sentences = torch.concat(s1_sentences, dim=0)
@@ -151,93 +154,96 @@ def process_tts_single(text, save_dir, voice1):
     return s1, save_path1
 
 def process_tts_multi(text, save_dir, voice1, voice2):
-    pattern = r'\(s(\d+)\)\s*(.?)(?=\s\(s\d+\)|$)'
-    matches = re.findall(pattern, text, re.DOTALL)
+    print(f"🎤 Processing 2-speaker TTS: {text}")
+    pattern = r'\(s(\d+)\)\s*([^()]*?)(?=\(s\d+\)|$)'
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    
+    if not matches:
+        print("❌ No speaker markers found. Treating as single speaker...")
+        return process_tts_single(text, save_dir, voice1)
     
     s1_sentences = []
     s2_sentences = []
-
-    pipeline = KPipeline(lang_code='a', repo_id='/content/drive/MyDrive/weights/Kokoro-82M')
-    for idx, (speaker, content) in enumerate(matches):
-        if speaker == '1':
-            voice_tensor = torch.load(voice1, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor,
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s1_sentences.append(audios)
-            s2_sentences.append(torch.zeros_like(audios))
-        elif speaker == '2':
-            voice_tensor = torch.load(voice2, weights_only=True)
-            generator = pipeline(
-                content, voice=voice_tensor,
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-            audios = torch.concat(audios, dim=0)
-            s2_sentences.append(audios)
-            s1_sentences.append(torch.zeros_like(audios))
-    
-    s1_sentences = torch.concat(s1_sentences, dim=0)
-    s2_sentences = torch.concat(s2_sentences, dim=0)
-    sum_sentences = s1_sentences + s2_sentences
-    save_path1 = f'{save_dir}/s1.wav'
-    save_path2 = f'{save_dir}/s2.wav'
-    save_path_sum = f'{save_dir}/sum.wav'
-    sf.write(save_path1, s1_sentences, 24000)
-    sf.write(save_path2, s2_sentences, 24000)
-    sf.write(save_path_sum, sum_sentences, 24000)
-
-    s1, _ = librosa.load(save_path1, sr=16000)
-    s2, _ = librosa.load(save_path2, sr=16000)
-    return s1, s2, save_path_sum
-
-def process_tts_triple(text, save_dir, voice1, voice2, voice3):
-    print(f"🔍 Processing TTS text: '{text}'")
-    
-    pattern = r'\(s(\d+)\)\s*([^()]?)(?=\s\(s\d+\)|\s*$)'
-    matches = re.findall(pattern, text)
-    
-    print(f"🔍 Found {len(matches)} speech segments")
-    for i, (speaker, content) in enumerate(matches):
-        content = content.strip()
-        print(f"  Segment {i}: Speaker {speaker}, Content: '{content}'")
-    
-    if not matches:
-        print("❌ No speech segments found! Trying alternative pattern...")
-        pattern2 = r'\(s(\d+)\)\s*(.*?)(?=\(s\d+\)|$)'
-        matches = re.findall(pattern2, text, re.DOTALL)
-        print(f"🔍 Alternative pattern found {len(matches)} segments")
-        for i, (speaker, content) in enumerate(matches):
-            content = content.strip()
-            print(f"  Segment {i}: Speaker {speaker}, Content: '{content}'")
-    
-    if not matches:
-        print("❌ Still no segments found. Creating fallback audio...")
-        fallback_audio = np.zeros(16000)
-        fallback_path = os.path.join(save_dir, 'sum.wav')
-        sf.write(fallback_path, fallback_audio, 16000)
-        return fallback_audio, fallback_audio, fallback_audio, fallback_path
-    
-    s1_sentences = []
-    s2_sentences = []
-    s3_sentences = []
-
     pipeline = KPipeline(lang_code='a', repo_id='/content/drive/MyDrive/weights/Kokoro-82M')
     
     for idx, (speaker, content) in enumerate(matches):
         content = content.strip()
         if not content:
-            print(f"⚠ Skipping empty content for speaker {speaker}")
             continue
             
-        print(f"🎤 Processing speaker {speaker}: '{content}'")
+        print(f"  Speaker {speaker}: '{content}'")
+        
+        try:
+            voice_tensor = torch.load(voice1 if speaker == '1' else voice2, weights_only=True)
+            generator = pipeline(content, voice=voice_tensor, speed=1, split_pattern=r'\n+')
+            audios = [audio for i, (gs, ps, audio) in enumerate(generator)]
+            
+            if audios:
+                combined = torch.concat(audios, dim=0)
+                if speaker == '1':
+                    s1_sentences.append(combined)
+                    s2_sentences.append(torch.zeros_like(combined))
+                else:
+                    s2_sentences.append(combined)
+                    s1_sentences.append(torch.zeros_like(combined))
+        except Exception as e:
+            print(f"⚠️ Error for speaker {speaker}: {e}")
+    
+    if not s1_sentences or not s2_sentences:
+        print("❌ No audio generated for speakers")
+        s1 = np.zeros(16000)
+        s2 = np.zeros(16000)
+        sum_path = os.path.join(save_dir, 'sum.wav')
+        sf.write(sum_path, s1, 16000)
+        return s1, s2, sum_path
+    
+    s1_combined = torch.concat(s1_sentences, dim=0) if s1_sentences else torch.tensor([])
+    s2_combined = torch.concat(s2_sentences, dim=0) if s2_sentences else torch.tensor([])
+    
+    max_len = max(len(s1_combined), len(s2_combined), 1)
+    
+    if len(s1_combined) < max_len:
+        s1_combined = torch.cat([s1_combined, torch.zeros(max_len - len(s1_combined))])
+    if len(s2_combined) < max_len:
+        s2_combined = torch.cat([s2_combined, torch.zeros(max_len - len(s2_combined))])
+    
+    sum_combined = s1_combined + s2_combined
+    
+    save_path1 = f'{save_dir}/s1.wav'
+    save_path2 = f'{save_dir}/s2.wav'
+    save_path_sum = f'{save_dir}/sum.wav'
+    
+    sf.write(save_path1, s1_combined.numpy(), 24000)
+    sf.write(save_path2, s2_combined.numpy(), 24000)
+    sf.write(save_path_sum, sum_combined.numpy(), 24000)
+    
+    s1, _ = librosa.load(save_path1, sr=16000)
+    s2, _ = librosa.load(save_path2, sr=16000)
+    
+    print(f"✅ 2-speaker audio generated")
+    return s1, s2, save_path_sum
+
+def process_tts_triple(text, save_dir, voice1, voice2, voice3):
+    print(f"🎤 Processing 3-speaker TTS: {text}")
+    pattern = r'\(s(\d+)\)\s*([^()]*?)(?=\(s\d+\)|$)'
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    
+    if not matches:
+        print("❌ No speaker markers found. Treating as single speaker...")
+        audio, path = process_tts_single(text, save_dir, voice1)
+        return audio, np.zeros(16000), np.zeros(16000), path
+    
+    s1_sentences = []
+    s2_sentences = []
+    s3_sentences = []
+    pipeline = KPipeline(lang_code='a', repo_id='/content/drive/MyDrive/weights/Kokoro-82M')
+    
+    for idx, (speaker, content) in enumerate(matches):
+        content = content.strip()
+        if not content:
+            continue
+            
+        print(f"  Speaker {speaker}: '{content}'")
         
         try:
             if speaker == '1':
@@ -247,91 +253,56 @@ def process_tts_triple(text, save_dir, voice1, voice2, voice3):
             elif speaker == '3':
                 voice_tensor = torch.load(voice3, weights_only=True)
             else:
-                print(f"❌ Unknown speaker: {speaker}")
                 continue
-                
-            generator = pipeline(
-                content, voice=voice_tensor,
-                speed=1, split_pattern=r'\n+'
-            )
-            audios = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audios.append(audio)
-                print(f"  Generated audio chunk {i}: {audio.shape}")
+            
+            generator = pipeline(content, voice=voice_tensor, speed=1, split_pattern=r'\n+')
+            audios = [audio for i, (gs, ps, audio) in enumerate(generator)]
             
             if audios:
-                combined_audio = torch.concat(audios, dim=0)
-                print(f"✅ Combined audio for speaker {speaker}: {combined_audio.shape}")
-                
+                combined = torch.concat(audios, dim=0)
                 if speaker == '1':
-                    s1_sentences.append(combined_audio)
-                    s2_sentences.append(torch.zeros_like(combined_audio))
-                    s3_sentences.append(torch.zeros_like(combined_audio))
+                    s1_sentences.append(combined)
+                    s2_sentences.append(torch.zeros_like(combined))
+                    s3_sentences.append(torch.zeros_like(combined))
                 elif speaker == '2':
-                    s2_sentences.append(combined_audio)
-                    s1_sentences.append(torch.zeros_like(combined_audio))
-                    s3_sentences.append(torch.zeros_like(combined_audio))
+                    s2_sentences.append(combined)
+                    s1_sentences.append(torch.zeros_like(combined))
+                    s3_sentences.append(torch.zeros_like(combined))
                 elif speaker == '3':
-                    s3_sentences.append(combined_audio)
-                    s1_sentences.append(torch.zeros_like(combined_audio))
-                    s2_sentences.append(torch.zeros_like(combined_audio))
-            else:
-                print(f"❌ No audio generated for speaker {speaker}")
-                
+                    s3_sentences.append(combined)
+                    s1_sentences.append(torch.zeros_like(combined))
+                    s2_sentences.append(torch.zeros_like(combined))
         except Exception as e:
-            print(f"❌ Error processing speaker {speaker}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    print(f"📊 Audio segments - s1: {len(s1_sentences)}, s2: {len(s2_sentences)}, s3: {len(s3_sentences)}")
+            print(f"⚠️ Error for speaker {speaker}: {e}")
     
     if not s1_sentences and not s2_sentences and not s3_sentences:
-        print("❌ No audio was generated for any speaker! Creating fallback...")
-        fallback_audio = np.zeros(16000)
-        fallback_path = os.path.join(save_dir, 'sum.wav')
-        sf.write(fallback_path, fallback_audio, 16000)
-        return fallback_audio, fallback_audio, fallback_audio, fallback_path
-
-    if s1_sentences:
-        s1_combined = torch.concat(s1_sentences, dim=0)
-        print(f"✅ Final speaker 1 audio: {s1_combined.shape}")
-    else:
-        s1_combined = torch.tensor([])
-        print("⚠ No audio for speaker 1")
-        
-    if s2_sentences:
-        s2_combined = torch.concat(s2_sentences, dim=0)
-        print(f"✅ Final speaker 2 audio: {s2_combined.shape}")
-    else:
-        s2_combined = torch.tensor([])
-        print("⚠ No audio for speaker 2")
-        
-    if s3_sentences:
-        s3_combined = torch.concat(s3_sentences, dim=0)
-        print(f"✅ Final speaker 3 audio: {s3_combined.shape}")
-    else:
-        s3_combined = torch.tensor([])
-        print("⚠ No audio for speaker 3")
-
-    lengths = [len(s1_combined), len(s2_combined), len(s3_combined)]
-    max_length = max(lengths) if lengths else 0
+        print("❌ No audio generated for any speaker")
+        s1 = s2 = s3 = np.zeros(16000)
+        sum_path = os.path.join(save_dir, 'sum.wav')
+        sf.write(sum_path, s1, 16000)
+        return s1, s2, s3, sum_path
     
-    print(f"📏 Audio lengths - s1: {len(s1_combined)}, s2: {len(s2_combined)}, s3: {len(s3_combined)}, max: {max_length}")
+    s1_combined = torch.concat(s1_sentences, dim=0) if s1_sentences else torch.tensor([])
+    s2_combined = torch.concat(s2_sentences, dim=0) if s2_sentences else torch.tensor([])
+    s3_combined = torch.concat(s3_sentences, dim=0) if s3_sentences else torch.tensor([])
     
-    if max_length == 0:
-        print("❌ All audio is empty! Creating fallback...")
-        fallback_audio = np.zeros(16000)
-        fallback_path = os.path.join(save_dir, 'sum.wav')
-        sf.write(fallback_path, fallback_audio, 16000)
-        return fallback_audio, fallback_audio, fallback_audio, fallback_path
-
-    if len(s1_combined) < max_length:
-        s1_combined = torch.cat([s1_combined, torch.zeros(max_length - len(s1_combined))])
-    if len(s2_combined) < max_length:
-        s2_combined = torch.cat([s2_combined, torch.zeros(max_length - len(s2_combined))])
-    if len(s3_combined) < max_length:
-        s3_combined = torch.cat([s3_combined, torch.zeros(max_length - len(s3_combined))])
-
+    max_len = max(len(s1_combined), len(s2_combined), len(s3_combined), 1)
+    
+    if len(s1_combined) == 0:
+        s1_combined = torch.zeros(max_len)
+    elif len(s1_combined) < max_len:
+        s1_combined = torch.cat([s1_combined, torch.zeros(max_len - len(s1_combined))])
+    
+    if len(s2_combined) == 0:
+        s2_combined = torch.zeros(max_len)
+    elif len(s2_combined) < max_len:
+        s2_combined = torch.cat([s2_combined, torch.zeros(max_len - len(s2_combined))])
+    
+    if len(s3_combined) == 0:
+        s3_combined = torch.zeros(max_len)
+    elif len(s3_combined) < max_len:
+        s3_combined = torch.cat([s3_combined, torch.zeros(max_len - len(s3_combined))])
+    
     sum_combined = s1_combined + s2_combined + s3_combined
     
     save_path1 = f'{save_dir}/s1.wav'
@@ -339,27 +310,19 @@ def process_tts_triple(text, save_dir, voice1, voice2, voice3):
     save_path3 = f'{save_dir}/s3.wav'
     save_path_sum = f'{save_dir}/sum.wav'
     
-    if len(s1_combined) > 0:
-        sf.write(save_path1, s1_combined.numpy(), 24000)
-        print(f"💾 Saved speaker 1 audio: {save_path1}")
-    if len(s2_combined) > 0:
-        sf.write(save_path2, s2_combined.numpy(), 24000)
-        print(f"💾 Saved speaker 2 audio: {save_path2}")
-    if len(s3_combined) > 0:
-        sf.write(save_path3, s3_combined.numpy(), 24000)
-        print(f"💾 Saved speaker 3 audio: {save_path3}")
-    
+    sf.write(save_path1, s1_combined.numpy(), 24000)
+    sf.write(save_path2, s2_combined.numpy(), 24000)
+    sf.write(save_path3, s3_combined.numpy(), 24000)
     sf.write(save_path_sum, sum_combined.numpy(), 24000)
-    print(f"💾 Saved mixed audio: {save_path_sum}")
-
-    s1, _ = librosa.load(save_path1, sr=16000) if len(s1_combined) > 0 else (np.array([]), 16000)
-    s2, _ = librosa.load(save_path2, sr=16000) if len(s2_combined) > 0 else (np.array([]), 16000)
-    s3, _ = librosa.load(save_path3, sr=16000) if len(s3_combined) > 0 else (np.array([]), 16000)
     
-    print(f"🎉 TTS processing completed successfully!")
-    print(f"📈 Final audio lengths - s1: {len(s1)}, s2: {len(s2)}, s3: {len(s3)}")
+    s1, _ = librosa.load(save_path1, sr=16000)
+    s2, _ = librosa.load(save_path2, sr=16000)
+    s3, _ = librosa.load(save_path3, sr=16000)
     
+    print(f"✅ 3-speaker audio generated")
     return s1, s2, s3, save_path_sum
+
+
 
 def initialize_models():
     """Initialize the WAN models with proper error handling"""
@@ -478,23 +441,19 @@ def home():
 def generate_tts_video():
     """Endpoint for TTS-based video generation"""
     try:
-        # Get uploaded files and data
         image_file = request.files.get('image')
         config_data = json.loads(request.form.get('config', '{}'))
         
         if not image_file:
             return jsonify({"error": "No image file provided"}), 400
         
-        # Generate unique job ID
         job_id = str(uuid.uuid4())
         job_folder = os.path.join(UPLOAD_FOLDER, job_id)
         os.makedirs(job_folder, exist_ok=True)
         
-        # Save uploaded image
         image_path = os.path.join(job_folder, image_file.filename)
         image_file.save(image_path)
         
-        # Prepare input data for WAN
         input_data = {
             "prompt": config_data.get("prompt", "A new avatar video."),
             "cond_image": image_path,
@@ -503,25 +462,32 @@ def generate_tts_video():
             "cond_audio": {}
         }
         
-        # Log the received data
-        logger.info(f"🎯 Received TTS video generation request:")
-        logger.info(f"   Job ID: {job_id}")
+        logger.info(f"🎯 TTS request - Job: {job_id}")
         logger.info(f"   Image: {image_file.filename}")
         logger.info(f"   Prompt: {input_data['prompt']}")
-        logger.info(f"   TTS Audio config: {json.dumps(input_data['tts_audio'], indent=2)}")
+        logger.info(f"   TTS voices: {list(input_data['tts_audio'].keys())}")
         
-        # Process TTS audio
         audio_save_dir = os.path.join(job_folder, 'audio')
         os.makedirs(audio_save_dir, exist_ok=True)
         
         tts_audio = input_data['tts_audio']
         text = tts_audio.get('text', '')
         
-        logger.info(f"🔊 Processing TTS for text: '{text}'")
+        logger.info(f"📝 Dialogue text: '{text}'")
         
-        if 'human2_voice' not in tts_audio.keys():
-            # Single speaker
-            logger.info("🎤 Single speaker TTS")
+        # Determine number of speakers and process accordingly
+        num_speakers = 0
+        if 'human1_voice' in tts_audio and tts_audio['human1_voice']:
+            num_speakers += 1
+        if 'human2_voice' in tts_audio and tts_audio['human2_voice']:
+            num_speakers += 1
+        if 'human3_voice' in tts_audio and tts_audio['human3_voice']:
+            num_speakers += 1
+        
+        logger.info(f"🎤 Number of speakers: {num_speakers}")
+        
+        if num_speakers == 1:
+            logger.info("→ Processing single speaker")
             new_human_speech1, sum_audio = process_tts_single(
                 text, audio_save_dir, tts_audio['human1_voice']
             )
@@ -533,34 +499,8 @@ def generate_tts_video():
             input_data['cond_audio']['person1'] = emb1_path
             input_data['video_audio'] = sum_audio
             
-        elif 'human3_voice' in tts_audio.keys() and tts_audio['human3_voice']:
-            # Three speakers
-            logger.info("🎤 Three speakers TTS")
-            new_human_speech1, new_human_speech2, new_human_speech3, sum_audio = process_tts_triple(
-                text, audio_save_dir,
-                tts_audio['human1_voice'],
-                tts_audio['human2_voice'],
-                tts_audio['human3_voice']
-            )
-            audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder, 16000, device)
-            audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder, 16000, device)
-            audio_embedding_3 = get_embedding(new_human_speech3, wav2vec_feature_extractor, audio_encoder, 16000, device)
-            
-            emb1_path = os.path.join(audio_save_dir, '1.pt')
-            emb2_path = os.path.join(audio_save_dir, '2.pt')
-            emb3_path = os.path.join(audio_save_dir, '3.pt')
-            
-            torch.save(audio_embedding_1, emb1_path)
-            torch.save(audio_embedding_2, emb2_path)
-            torch.save(audio_embedding_3, emb3_path)
-            
-            input_data['cond_audio']['person1'] = emb1_path
-            input_data['cond_audio']['person2'] = emb2_path
-            input_data['cond_audio']['person3'] = emb3_path
-            input_data['video_audio'] = sum_audio
-        else:
-            # Two speakers
-            logger.info("🎤 Two speakers TTS")
+        elif num_speakers == 2:
+            logger.info("→ Processing 2 speakers")
             new_human_speech1, new_human_speech2, sum_audio = process_tts_multi(
                 text, audio_save_dir,
                 tts_audio['human1_voice'],
@@ -578,15 +518,35 @@ def generate_tts_video():
             input_data['cond_audio']['person1'] = emb1_path
             input_data['cond_audio']['person2'] = emb2_path
             input_data['video_audio'] = sum_audio
+            
+        elif num_speakers >= 3:
+            logger.info("→ Processing 3 speakers")
+            new_human_speech1, new_human_speech2, new_human_speech3, sum_audio = process_tts_triple(
+                text, audio_save_dir,
+                tts_audio['human1_voice'],
+                tts_audio['human2_voice'],
+                tts_audio.get('human3_voice', '')
+            )
+            audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder, 16000, device)
+            audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder, 16000, device)
+            audio_embedding_3 = get_embedding(new_human_speech3, wav2vec_feature_extractor, audio_encoder, 16000, device)
+            
+            emb1_path = os.path.join(audio_save_dir, '1.pt')
+            emb2_path = os.path.join(audio_save_dir, '2.pt')
+            emb3_path = os.path.join(audio_save_dir, '3.pt')
+            
+            torch.save(audio_embedding_1, emb1_path)
+            torch.save(audio_embedding_2, emb2_path)
+            torch.save(audio_embedding_3, emb3_path)
+            
+            input_data['cond_audio']['person1'] = emb1_path
+            input_data['cond_audio']['person2'] = emb2_path
+            input_data['cond_audio']['person3'] = emb3_path
+            input_data['video_audio'] = sum_audio
         
-        # Log final input data for WAN
-        logger.info(f"📋 Final input data for WAN:")
-        logger.info(f"   Prompt: {input_data['prompt']}")
-        logger.info(f"   Image: {input_data['cond_image']}")
-        logger.info(f"   Audio embeddings: {list(input_data['cond_audio'].keys())}")
-        logger.info(f"   Video audio: {input_data['video_audio']}")
+        logger.info(f"✅ Audio processed - embeddings: {list(input_data['cond_audio'].keys())}")
         
-        # Start video generation in background thread
+        # Start video generation
         output_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}")
         thread = threading.Thread(
             target=generate_video_worker,
@@ -597,11 +557,13 @@ def generate_tts_video():
         return jsonify({
             "job_id": job_id,
             "status": "started",
-            "message": "Video generation started"
+            "message": f"Video generation started for {num_speakers} speaker(s)"
         })
         
     except Exception as e:
-        logger.error(f"❌ Error in TTS video generation: {e}")
+        logger.error(f"❌ Error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/generate-audio-video', methods=['POST'])
