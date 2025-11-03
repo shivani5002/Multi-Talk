@@ -500,6 +500,16 @@ def generate_video_worker(input_data, output_path, job_id):
         with open(error_file, 'w') as f:
             f.write(f"Job {job_id} failed:\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
+
+def pad_embedding(emb, target_frames=81):
+    cur_frames = emb.shape[0]
+    if cur_frames < target_frames:
+        pad_shape = (target_frames - cur_frames, ) + emb.shape[1:]
+        pad = torch.zeros(pad_shape, dtype=emb.dtype)
+        emb = torch.cat([emb, pad], dim=0)
+    return emb
+
+
 @app.route('/')
 def home():
     return jsonify({"message": "WAN Video Generation API", "status": "running"})
@@ -635,104 +645,70 @@ def generate_tts_video():
 
 @app.route('/api/generate-audio-video', methods=['POST'])
 def generate_audio_video():
-    """Endpoint for audio file-based video generation"""
-    try:
-        image_file = request.files.get('image')
-        audio_files = request.files.getlist('audio_files')
-        config_data = json.loads(request.form.get('config', '{}'))
-        
-        if not image_file or not audio_files:
-            return jsonify({"error": "Image and audio files are required"}), 400
-        
-        job_id = str(uuid.uuid4())
-        job_folder = os.path.join(UPLOAD_FOLDER, job_id)
-        os.makedirs(job_folder, exist_ok=True)
-        
-        image_path = os.path.join(job_folder, image_file.filename)
-        image_file.save(image_path)
-        
-        audio_save_dir = os.path.join(job_folder, 'audio')
-        os.makedirs(audio_save_dir, exist_ok=True)
-        
-        num_speakers = len(audio_files)
-        logger.info(f"🎯 Audio-to-video request - Job: {job_id}")
-        logger.info(f"   Number of speakers: {num_speakers}")
-        
-        cond_audio = {}
-        all_audio_arrays = []
-        
-        # ✅ Process uploaded audio files
-        for i, audio_file in enumerate(audio_files):
-            audio_path = os.path.join(job_folder, f'person{i+1}.wav')
-            audio_file.save(audio_path)
-            logger.info(f"   Audio {i+1}: {audio_file.filename}")
-            
-            # Process audio
-            speech = audio_prepare_single(audio_path)
-            all_audio_arrays.append(speech)
-            
-            # Get embedding
-            emb = get_embedding(speech, wav2vec_feature_extractor, audio_encoder, 16000, device)
-            emb_path = os.path.join(audio_save_dir, f'{i+1}.pt')
-            torch.save(emb, emb_path)
-            
-            cond_audio[f'person{i+1}'] = emb_path
-            logger.info(f"✅ Audio {i+1} processed")
-        
-        # ✅ CRITICAL: Always provide 3 speakers (pad with zeros if needed)
-        logger.info(f"📝 Padding embeddings for {3 - num_speakers} missing speaker(s)...")
-        
-        # Get reference shape from first embedding
-        ref_emb = torch.load(cond_audio['person1'])
-        seq_len, batch_size, embed_dim = ref_emb.shape
-        
-        # Create zero embeddings for missing speakers
-        for i in range(num_speakers + 1, 4):  # Fill up to person3
-            zero_emb = torch.zeros(seq_len, batch_size, embed_dim)
-            emb_path = os.path.join(audio_save_dir, f'{i}.pt')
-            torch.save(zero_emb, emb_path)
-            cond_audio[f'person{i}'] = emb_path
-            logger.info(f"✅ Created zero embedding for person{i}")
-        
-        # Create mixed audio
-        if all_audio_arrays:
-            max_len = max([len(a) for a in all_audio_arrays])
-            padded = [np.pad(a, (0, max_len - len(a))) for a in all_audio_arrays]
-            sum_audio = np.sum(padded, axis=0)
-            sum_audio_path = os.path.join(audio_save_dir, 'sum.wav')
-            sf.write(sum_audio_path, sum_audio, 16000)
-            logger.info(f"✅ Mixed audio created")
-        
-        # Prepare input data
-        input_data = {
-            "prompt": config_data.get("prompt", "A person speaking with natural expressions."),
-            "cond_image": image_path,
-            "audio_type": "para",
-            "cond_audio": cond_audio,
-            "video_audio": sum_audio_path
-        }
-        
-        logger.info(f"📋 Cond audio keys: {list(cond_audio.keys())}")
-        
-        # Start video generation
-        output_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}")
-        thread = threading.Thread(
-            target=generate_video_worker,
-            args=(input_data, output_path, job_id)
-        )
-        thread.start()
-        
-        return jsonify({
-            "job_id": job_id,
-            "status": "started",
-            "message": f"Video generation started for {num_speakers} speaker(s)"
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+    image_file = request.files.get('image')
+    audio_files = request.files.getlist('audio_files')
+    config_data = json.loads(request.form.get('config', '{}'))
+
+    if not image_file or not audio_files:
+        return jsonify({"error": "Image and audio files are required"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_folder = os.path.join(UPLOAD_FOLDER, job_id)
+    os.makedirs(job_folder, exist_ok=True)
+
+    image_path = os.path.join(job_folder, image_file.filename)
+    image_file.save(image_path)
+
+    audio_save_dir = os.path.join(job_folder, 'audio')
+    os.makedirs(audio_save_dir, exist_ok=True)
+
+    cond_audio = {}
+    all_audio_arrays = []
+
+    # Process audio & get embeddings with padding
+    for i, audio_file in enumerate(audio_files):
+        audio_path = os.path.join(job_folder, f'person{i+1}.wav')
+        audio_file.save(audio_path)
+
+        speech = audio_prepare_single(audio_path)
+        all_audio_arrays.append(speech)
+
+        emb = get_embedding(speech, wav2vec_feature_extractor, audio_encoder, 16000, device)
+        emb = pad_embedding(emb, target_frames=81)  # Pad to 81 frames
+
+        emb_path = os.path.join(audio_save_dir, f'{i+1}.pt')
+        torch.save(emb, emb_path)
+
+        cond_audio[f'person{i+1}'] = emb_path
+
+    # Pad missing speakers with zero embeddings of correct shape
+    ref_emb = torch.load(cond_audio['person1'])
+    seq_len, batch_size, embed_dim = ref_emb.shape
+
+    for i in range(len(audio_files) + 1, 4):
+        zero_emb = torch.zeros((81, batch_size, embed_dim))
+        emb_path = os.path.join(audio_save_dir, f'{i}.pt')
+        torch.save(zero_emb, emb_path)
+        cond_audio[f'person{i}'] = emb_path
+
+    # Create mix audio for syncing
+    max_len = max([len(a) for a in all_audio_arrays])
+    padded = [np.pad(a, (0, max_len - len(a))) for a in all_audio_arrays]
+    sum_audio = np.sum(padded, axis=0)
+    sum_audio_path = os.path.join(audio_save_dir, 'sum.wav')
+    sf.write(sum_audio_path, sum_audio, 16000)
+
+    # Prepare input data
+    input_data = {
+        "prompt": config_data.get("prompt", "A person speaking with natural expressions."),
+        "cond_image": image_path,
+        "audio_type": "para",
+        "cond_audio": cond_audio,
+        "video_audio": sum_audio_path
+    }
+
+    # Start video generation thread as before...
+
 
 @app.route('/api/status/<job_id>', methods=['GET'])
 def get_status(job_id):
