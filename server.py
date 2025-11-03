@@ -9,6 +9,7 @@ from datetime import datetime
 import subprocess
 import logging
 from pyngrok import ngrok
+from wan.utils.multitalk_utils import save_video_ffmpeg
 
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
@@ -86,29 +87,54 @@ def loudness_norm(audio_array, sr=16000, lufs=-23):
     return normalized_audio
 
 def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=16000, device='cpu'):
-    audio_duration = len(speech_array) / sr
-    video_length = audio_duration * 25  # Assume the video fps is 25
-
-    # wav2vec_feature_extractor
-    audio_feature = np.squeeze(
-        wav2vec_feature_extractor(speech_array, sampling_rate=sr).input_values
-    )
-    audio_feature = torch.from_numpy(audio_feature).float().to(device=device)
-    audio_feature = audio_feature.unsqueeze(0)
-
-    # audio encoder
-    with torch.no_grad():
-        embeddings = audio_encoder(audio_feature, seq_len=int(video_length), output_hidden_states=True)
-
-    if len(embeddings) == 0:
-        print("Fail to extract audio embedding")
+    """Extract audio embeddings with JSON logging"""
+    try:
+        audio_duration = len(speech_array) / sr
+        video_length = audio_duration * 25
+        
+        logger.info(f"\n🔍 EMBEDDING EXTRACTION")
+        logger.info(f"   Audio duration: {audio_duration:.2f}s")
+        logger.info(f"   Video length: {video_length:.0f} frames")
+        logger.info(f"   Speech array shape: {speech_array.shape}")
+        
+        audio_feature = np.squeeze(
+            wav2vec_feature_extractor(speech_array, sampling_rate=sr).input_values
+        )
+        audio_feature = torch.from_numpy(audio_feature).float().to(device=device)
+        audio_feature = audio_feature.unsqueeze(0)
+        
+        logger.info(f"   Audio feature shape: {audio_feature.shape}")
+        
+        with torch.no_grad():
+            embeddings = audio_encoder(audio_feature, seq_len=int(video_length), output_hidden_states=True)
+        
+        if len(embeddings) == 0:
+            logger.error("❌ Failed to extract embedding")
+            return None
+        
+        audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)
+        audio_emb = rearrange(audio_emb, "b s d -> s b d")
+        audio_emb = audio_emb.cpu().detach()
+        
+        embedding_info = {
+            "shape": str(audio_emb.shape),
+            "dtype": str(audio_emb.dtype),
+            "dimensions": {
+                "sequence_length": audio_emb.shape[0],
+                "batch_size": audio_emb.shape[1],
+                "embedding_dim": audio_emb.shape[2]
+            }
+        }
+        log_json("✅ EMBEDDING EXTRACTED", embedding_info)
+        
+        return audio_emb
+        
+    except Exception as e:
+        logger.error(f"❌ Error in get_embedding: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
-    audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)
-    audio_emb = rearrange(audio_emb, "b s d -> s b d")
-
-    audio_emb = audio_emb.cpu().detach()
-    return audio_emb
 
 def extract_audio_from_video(filename, sample_rate):
     raw_audio_path = filename.split('/')[-1].split('.')[0] + '.wav'
@@ -413,7 +439,32 @@ def initialize_models():
 def generate_video_worker(input_data, output_path, job_id):
     """Worker function with better error handling"""
     try:
-        logger.info(f"🎬 Starting video generation for job {job_id}")
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🎬 VIDEO GENERATION STARTED - Job: {job_id}")
+        logger.info(f"{'='*80}")
+        
+        # Log complete input data
+        input_log = {
+            "prompt": input_data.get("prompt", "N/A"),
+            "cond_image": input_data.get("cond_image", "N/A"),
+            "audio_type": input_data.get("audio_type", "N/A"),
+            "video_audio": input_data.get("video_audio", "N/A"),
+            "speakers": list(input_data.get("cond_audio", {}).keys()),
+            "speaker_details": {}
+        }
+        
+        # Add embedding details
+        for key, path in input_data.get("cond_audio", {}).items():
+            if os.path.exists(path):
+                emb = torch.load(path)
+                input_log["speaker_details"][key] = {
+                    "path": path,
+                    "shape": str(emb.shape),
+                    "dtype": str(emb.dtype)
+                }
+        
+        log_json("📋 VIDEO GENERATION INPUT DATA", input_log)
+        
         
         if wan_pipeline is None:
             error_msg = "❌ wan_pipeline is None! Models not loaded properly."
@@ -511,8 +562,13 @@ def home():
 def generate_tts_video():
     """Endpoint for TTS-based video generation"""
     try:
+        logger.info(f"\n{'='*80}")
+        logger.info("📤 TTS VIDEO REQUEST RECEIVED")
+        logger.info(f"{'='*80}")
         image_file = request.files.get('image')
         config_data = json.loads(request.form.get('config', '{}'))
+
+        log_json("📨 REQUEST CONFIG", config_data)
         
         if not image_file:
             return jsonify({"error": "No image file provided"}), 400
@@ -635,14 +691,40 @@ def generate_tts_video():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+    
+# Add this helper function for JSON logging
+def log_json(label, data):
+    """Pretty print JSON data to logger"""
+    logger.info(f"\n{'='*70}")
+    logger.info(f"📋 {label}")
+    logger.info(f"{'='*70}")
+    try:
+        logger.info(json.dumps(data, indent=2, default=str))
+    except Exception as e:
+        logger.info(f"[JSON serialization error]: {str(data)}")
+    logger.info(f"{'='*70}\n")
+
 
 @app.route('/api/generate-audio-video', methods=['POST'])
 def generate_audio_video():
     """Endpoint for audio file-based video generation"""
     try:
+        logger.info(f"\n{'='*80}")
+        logger.info("📤 AUDIO VIDEO REQUEST RECEIVED")
+        logger.info(f"{'='*80}")
+        
         image_file = request.files.get('image')
         audio_files = request.files.getlist('audio_files')
         config_data = json.loads(request.form.get('config', '{}'))
+        
+        # ✅ ADD THIS
+        request_info = {
+            "image": image_file.filename if image_file else None,
+            "audio_files_count": len(audio_files),
+            "audio_files": [f.filename for f in audio_files],
+            "config": config_data
+        }
+        log_json("📨 REQUEST INFO", request_info)
         
         if not image_file or not audio_files:
             return jsonify({"error": "Image and audio files are required"}), 400
