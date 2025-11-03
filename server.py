@@ -357,8 +357,10 @@ def initialize_models():
             logger.info("📦 Importing WAN modules...")
             import wan as wan_module
             wan = wan_module
-            from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS as WAN_CONFIGS_module
-            WAN_CONFIGS = WAN_CONFIGS_module
+            
+            # ✅ FIX: Properly import WAN_CONFIGS
+            from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS as WAN_CONFIGS_import
+            WAN_CONFIGS = WAN_CONFIGS_import  # ← Update global
             logger.info("✅ WAN modules imported successfully")
         
         # Initialize Wav2Vec2
@@ -371,7 +373,7 @@ def initialize_models():
         
         # Initialize WAN pipeline
         logger.info("⏳ Loading WAN pipeline (this takes 10-15 minutes)...")
-        cfg = WAN_CONFIGS["multitalk-14B"]
+        cfg = WAN_CONFIGS["multitalk-14B"]  # ← This uses the global now
         
         wan_pipeline = wan.MultiTalkPipeline(
             config=cfg,
