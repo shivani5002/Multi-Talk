@@ -13,7 +13,6 @@ from pyngrok import ngrok
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
 import warnings
-from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
@@ -22,13 +21,13 @@ import random
 import torch
 import torch.distributed as dist
 from PIL import Image
-import subprocess
+# import subprocess
 
-import wan
-from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
-from wan.utils.utils import cache_image, cache_video, str2bool
-from wan.utils.multitalk_utils import save_video_ffmpeg
-from kokoro import KPipeline
+# import wan
+# from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
+# from wan.utils.utils import cache_image, cache_video, str2bool
+# from wan.utils.multitalk_utils import save_video_ffmpeg
+# from kokoro import KPipeline
 from transformers import Wav2Vec2FeatureExtractor
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 
@@ -38,6 +37,11 @@ import numpy as np
 from einops import rearrange
 import soundfile as sf
 import re
+from kokoro import KPipeline
+from src.audio_analysis.wav2vec2 import Wav2Vec2Model
+
+wan = None
+WAN_CONFIGS = None
 
 # Flask app setup
 app = Flask(__name__)
@@ -334,12 +338,11 @@ def process_tts_triple(text, save_dir, voice1, voice2, voice3):
 
 def initialize_models():
     """Initialize the WAN models with caching - only loads once!"""
-    global wan_pipeline, wav2vec_feature_extractor, audio_encoder, _models_cache
+    global wan_pipeline, wav2vec_feature_extractor, audio_encoder, _models_cache, wan, WAN_CONFIGS
     
     # ✅ CHECK: Are models already loaded?
     if _models_cache['initialized']:
         logger.info("⚡ Models already loaded! Using cached models (INSTANT)")
-        # ✅ CRITICAL: Update global variables from cache
         wan_pipeline = _models_cache['wan_pipeline']
         wav2vec_feature_extractor = _models_cache['wav2vec_feature_extractor']
         audio_encoder = _models_cache['audio_encoder']
@@ -348,6 +351,15 @@ def initialize_models():
     
     try:
         logger.info("🔄 Loading models for the FIRST TIME (this takes 15-20 minutes)...")
+        
+        # ✅ Import wan HERE - after CUDA is ready
+        if wan is None:
+            logger.info("📦 Importing WAN modules...")
+            import wan as wan_module
+            wan = wan_module
+            from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS as WAN_CONFIGS_module
+            WAN_CONFIGS = WAN_CONFIGS_module
+            logger.info("✅ WAN modules imported successfully")
         
         # Initialize Wav2Vec2
         logger.info("⏳ Loading Wav2Vec2 model...")
@@ -379,7 +391,7 @@ def initialize_models():
         if wan_pipeline is None:
             raise Exception("WAN pipeline creation failed")
         
-        # ✅ CACHE THE MODELS - Store in dictionary
+        # ✅ CACHE THE MODELS
         _models_cache['wan_pipeline'] = wan_pipeline
         _models_cache['wav2vec_feature_extractor'] = wav2vec_feature_extractor
         _models_cache['audio_encoder'] = audio_encoder
@@ -387,13 +399,13 @@ def initialize_models():
         
         logger.info("✅✅ ALL MODELS LOADED AND CACHED!")
         logger.info("🎉 Future requests will be INSTANT (no 20-minute wait)")
-        logger.info(f"Cache status: initialized={_models_cache['initialized']}")
         
     except Exception as e:
         logger.error(f"❌ Error loading models: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise
+
 
 
 def generate_video_worker(input_data, output_path, job_id):
