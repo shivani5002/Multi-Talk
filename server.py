@@ -828,24 +828,54 @@ def get_status(job_id):
         return jsonify({
             "job_id": job_id,
             "status": "completed",
-            "video_url": f"/api/download/{job_id}"
+            "video_url": f"/api/video/{job_id}"  # Changed to video endpoint
         })
     else:
-        return jsonify({
-            "job_id": job_id,
-            "status": "processing"
-        })
+        # Check if job is still processing
+        job_folder = os.path.join(UPLOAD_FOLDER, job_id)
+        if os.path.exists(job_folder):
+            return jsonify({
+                "job_id": job_id,
+                "status": "processing"
+            })
+        else:
+            return jsonify({
+                "job_id": job_id,
+                "status": "not_found"
+            }), 404
+
+@app.route('/api/video/<job_id>', methods=['GET'])
+def stream_video(job_id):
+    """Stream generated video for display in browser"""
+    video_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}.mp4")
+    
+    if os.path.exists(video_path):
+        # Set proper headers for video streaming
+        response = send_file(
+            video_path,
+            as_attachment=False,  # Don't force download
+            mimetype='video/mp4',
+            conditional=True  # Supports range requests for streaming
+        )
+        
+        # Add CORS headers
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Cross-Origin-Resource-Policy'] = 'cross-origin'
+        
+        return response
+    else:
+        return jsonify({"error": "Video not found"}), 404
 
 @app.route('/api/download/<job_id>', methods=['GET'])
 def download_video(job_id):
-    """Download generated video"""
+    """Download generated video (for download button)"""
     video_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}.mp4")
     
     if os.path.exists(video_path):
         return send_file(video_path, as_attachment=True)
     else:
         return jsonify({"error": "Video not found"}), 404
-
 def start_ngrok():
     """Start ngrok tunnel"""
     try:
