@@ -1,6 +1,7 @@
 # app.py
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+import werkzeug.exceptions
 import os
 import json
 import uuid
@@ -48,6 +49,8 @@ WAN_CONFIGS = None
 app = Flask(__name__)
 CORS(app)
 
+
+
 # Configuration
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'outputs'
@@ -72,6 +75,97 @@ _models_cache = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ✅ ADD: Handle CORS preflight requests
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight OPTIONS requests"""
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, ngrok-skip-browser-warning'
+        response.headers['Access-Control-Max-Age'] = '3600'
+        return response
+
+# ✅ ADD: Set CORS headers on all responses
+@app.after_request
+def set_cors_headers(response):
+    """Ensure all responses have proper CORS headers"""
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, ngrok-skip-browser-warning'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    
+    # Ensure JSON error responses
+    if response.status_code >= 400 and 'application/json' not in response.headers.get('Content-Type', ''):
+        response.headers['Content-Type'] = 'application/json'
+    
+    return response
+
+
+# ✅ ADD: Custom API error class
+class APIError(Exception):
+    """Custom exception for API errors"""
+    def __init__(self, message, status_code=400, payload=None):
+        super().__init__()
+        self.message = message
+        self.status_code = status_code
+        self.payload = payload
+
+    def to_dict(self):
+        rv = dict(self.payload or ())
+        rv['error'] = self.message
+        rv['status'] = self.status_code
+        return rv
+
+# ✅ ADD: Error handlers that return JSON
+@app.errorhandler(APIError)
+def handle_api_error(error):
+    """Handle custom API errors"""
+    response = jsonify(error.to_dict())
+    response.status_code = error.status_code
+    return response
+
+@app.errorhandler(werkzeug.exceptions.BadRequest)
+def handle_bad_request(e):
+    """Handle 400 Bad Request"""
+    return jsonify({
+        "error": "Bad Request",
+        "message": str(e.description),
+        "status": 400
+    }), 400
+
+@app.errorhandler(werkzeug.exceptions.NotFound)
+def handle_not_found(e):
+    """Handle 404 Not Found"""
+    return jsonify({
+        "error": "Not Found",
+        "message": "The requested resource was not found.",
+        "status": 404
+    }), 404
+
+@app.errorhandler(werkzeug.exceptions.InternalServerError)
+def handle_internal_error(e):
+    """Handle 500 Internal Server Error"""
+    logger.error(f"Internal Server Error: {e}")
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": "An unexpected error occurred.",
+        "status": 500
+    }), 500
+
+@app.errorhandler(Exception)
+def handle_generic_error(e):
+    """Catch-all for any uncaught exceptions"""
+    logger.error(f"Unhandled Exception: {e}", exc_info=True)
+    return jsonify({
+        "error": "Server Error",
+        "message": str(e),
+        "status": 500
+    }), 500
+
+
+
 def custom_init(device, wav2vec_dir):    
     audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec_dir, local_files_only=True).to(device)
     audio_encoder.feature_extractor._freeze_parameters()
@@ -85,6 +179,19 @@ def loudness_norm(audio_array, sr=16000, lufs=-23):
         return audio_array
     normalized_audio = pyln.normalize.loudness(audio_array, loudness, lufs)
     return normalized_audio
+
+# Add this helper function for JSON logging
+def log_json(label, data):
+    """Pretty print JSON data to logger"""
+    logger.info(f"\n{'='*70}")
+    logger.info(f"📋 {label}")
+    logger.info(f"{'='*70}")
+    try:
+        logger.info(json.dumps(data, indent=2, default=str))
+    except Exception as e:
+        logger.info(f"[JSON serialization error]: {str(data)}")
+    logger.info(f"{'='*70}\n")
+    
 
 def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=16000, device='cpu'):
     """Extract audio embeddings with JSON logging"""
@@ -692,17 +799,6 @@ def generate_tts_video():
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
     
-# Add this helper function for JSON logging
-def log_json(label, data):
-    """Pretty print JSON data to logger"""
-    logger.info(f"\n{'='*70}")
-    logger.info(f"📋 {label}")
-    logger.info(f"{'='*70}")
-    try:
-        logger.info(json.dumps(data, indent=2, default=str))
-    except Exception as e:
-        logger.info(f"[JSON serialization error]: {str(data)}")
-    logger.info(f"{'='*70}\n")
 
 
 @app.route('/api/generate-audio-video', methods=['POST'])
@@ -821,28 +917,66 @@ def generate_audio_video():
 
 @app.route('/api/status/<job_id>', methods=['GET'])
 def get_status(job_id):
-    """Check status of a generation job"""
-    video_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}.mp4")
-    
-    if os.path.exists(video_path):
+    """Check status of a generation job - with proper error handling"""
+    try:
+        # Validate job_id
+        if not job_id or len(job_id) == 0:
+            return jsonify({
+                "error": "Invalid job_id",
+                "status": 400
+            }), 400
+        
+        video_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}.mp4")
+        error_path = os.path.join(OUTPUT_FOLDER, f"video_{job_id}_error.txt")
+        job_folder = os.path.join(UPLOAD_FOLDER, job_id)
+        
+        # Check for completion
+        if os.path.exists(video_path):
+            logger.info(f"✅ Job {job_id} completed")
+            return jsonify({
+                "job_id": job_id,
+                "status": "completed",
+                "video_url": f"/api/video/{job_id}",
+                "message": "Video ready"
+            }), 200
+        
+        # Check for error
+        if os.path.exists(error_path):
+            with open(error_path, 'r') as f:
+                error_msg = f.read()
+            logger.error(f"❌ Job {job_id} failed")
+            return jsonify({
+                "job_id": job_id,
+                "status": "failed",
+                "error": "Video generation failed",
+                "message": error_msg[:500]
+            }), 200  # Still 200 because request succeeded
+        
+        # Check if still processing
+        if os.path.exists(job_folder):
+            logger.info(f"⏳ Job {job_id} processing")
+            return jsonify({
+                "job_id": job_id,
+                "status": "processing",
+                "message": "Video generation in progress"
+            }), 200
+        
+        # Job not found
+        logger.warning(f"⚠️ Job {job_id} not found")
         return jsonify({
             "job_id": job_id,
-            "status": "completed",
-            "video_url": f"/api/video/{job_id}"  # Changed to video endpoint
-        })
-    else:
-        # Check if job is still processing
-        job_folder = os.path.join(UPLOAD_FOLDER, job_id)
-        if os.path.exists(job_folder):
-            return jsonify({
-                "job_id": job_id,
-                "status": "processing"
-            })
-        else:
-            return jsonify({
-                "job_id": job_id,
-                "status": "not_found"
-            }), 404
+            "status": "not_found",
+            "error": "Job not found"
+        }), 404
+        
+    except Exception as e:
+        logger.error(f"❌ Error in get_status: {e}", exc_info=True)
+        return jsonify({
+            "error": "Server error",
+            "message": str(e),
+            "status": 500
+        }), 500
+
 
 @app.route('/api/video/<job_id>', methods=['GET'])
 def stream_video(job_id):
